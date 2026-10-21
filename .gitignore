@@ -34,3 +34,9 @@ models/*/.venv/
 models/*/build*/
 models/*/checkpoint*
 models/*/convert*.log
+
+# Windows port build products
+windows/node_modules/
+windows/dist/
+windows/release/
+windows/test-results/

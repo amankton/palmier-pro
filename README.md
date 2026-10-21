@@ -107,6 +107,10 @@ See [FAQ.md](FAQ.md) for more.
 
 See [CONTRIBUTING.md](CONTRIBUTING.md)
 
+### Windows alpha in this fork
+
+This fork now includes a separate [Windows desktop alpha](windows/README.md) using Electron and FFmpeg. It supports a limited local editing workflow, not full Mac feature or project-format parity. The original Swift application remains unchanged. See the [verification record](windows/VERIFICATION.md) for executable locations, tests and release limitations. This is not an official upstream Windows release.
+
 ## Community &amp; Support
 
 - **Discord:** Join the community on **[Discord](https://discord.com/invite/SMVW6pKYmg)**.

@@ -1,0 +1,156 @@
+import assert from 'node:assert/strict';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
+import { mkdtemp, mkdir, readFile, writeFile, readdir } from 'node:fs/promises';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { _electron as electron } from 'playwright';
+import { discoverTools, probeMedia } from '../media/ffmpeg.mjs';
+
+const run = promisify(execFile);
+const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+await mkdir(path.join(root, 'test-results'), { recursive: true });
+const work = await mkdtemp(path.join(root, 'test-results', 'desktop-'));
+const clipPath = path.join(work, 'Source clip with spaces.mp4');
+const audioPath = path.join(work, 'Background tone.wav');
+const tools = await discoverTools();
+await run(tools.ffmpegPath, ['-hide_banner', '-loglevel', 'error', '-f', 'lavfi', '-i', 'testsrc2=size=320x180:rate=30:duration=2', '-f', 'lavfi', '-i', 'sine=frequency=440:sample_rate=48000:duration=2', '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-c:a', 'aac', '-shortest', clipPath], { windowsHide: true });
+await run(tools.ffmpegPath, ['-hide_banner', '-loglevel', 'error', '-f', 'lavfi', '-i', 'sine=frequency=220:sample_rate=48000:duration=2', audioPath], { windowsHide: true });
+const app = await electron.launch({
+  args: process.env.PALMIER_SMOKE_EXECUTABLE ? [] : [root], executablePath: process.env.PALMIER_SMOKE_EXECUTABLE || undefined, cwd: root, timeout: 30000,
+  env: { ...process.env, PALMIER_TEST_HIDDEN: '1', PALMIER_TEST_USER_DATA: path.join(work, 'user-data') },
+});
+const errors = [];
+let page;
+const capture = async (filename) => {
+  const encoded = await app.evaluate(async ({ BrowserWindow }) => {
+    const image = await BrowserWindow.getAllWindows()[0].webContents.capturePage(undefined, { stayHidden: true, stayAwake: true });
+    return image.toPNG().toString('base64');
+  });
+  await writeFile(path.join(work, filename), Buffer.from(encoded, 'base64'));
+};
+const projectPath = path.join(work, 'Smoke project.palmierpc');
+const exportPath = path.join(work, 'Smoke export.mp4');
+try {
+  page = await app.firstWindow();
+  page.on('pageerror', (error) => errors.push(error.message));
+  page.on('console', (message) => { if (message.type() === 'error') console.error('RENDERER:', message.text()); });
+  page.on('dialog', (dialog) => dialog.accept());
+  await page.waitForFunction(() => Boolean(window.palmier));
+  const status = await page.evaluate(() => window.palmier.getStatus());
+  assert.equal(status.tools.available, true, status.tools.error);
+  const prefs = await app.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[0].webContents.getLastWebPreferences());
+  assert.equal(prefs.contextIsolation, true);
+  assert.equal(prefs.sandbox, true);
+  assert.equal(prefs.nodeIntegration, false);
+  assert.equal(await page.evaluate(() => typeof window.require), 'undefined');
+  await app.evaluate(({ dialog }, files) => { dialog.showOpenDialog = async () => ({ canceled: false, filePaths: files }); dialog.showMessageBoxSync = () => 1; }, [clipPath, audioPath]);
+  await page.getByLabel('Project resolution').selectOption('1280x720');
+  await page.getByLabel('Project name', { exact: true }).fill('Windows smoke sequence');
+  await page.getByTestId('import-media').click();
+  await page.getByTestId('media-asset').first().waitFor();
+  assert.equal(await page.getByTestId('media-asset').count(), 2);
+  await page.getByTestId('media-asset').filter({ hasText: 'Source clip with spaces' }).click();
+  await page.waitForFunction(() => [...document.images].some((image) => image.complete && image.naturalWidth > 0));
+  await page.waitForFunction(() => { const video = document.querySelector('video'); return video && video.readyState >= 1 && video.videoWidth === 320; });
+  const sourceUrl = await page.locator('video').getAttribute('src');
+  const protocolCheck = await app.evaluate(async ({ session }, url) => {
+    const range = await session.defaultSession.fetch(url, { headers: { Range: 'bytes=0-31' } });
+    const head = await session.defaultSession.fetch(url, { method: 'HEAD' });
+    return { rangeStatus: range.status, rangeLength: (await range.arrayBuffer()).byteLength, headStatus: head.status, headLength: (await head.arrayBuffer()).byteLength };
+  }, sourceUrl);
+  assert.deepEqual(protocolCheck, { rangeStatus: 206, rangeLength: 32, headStatus: 200, headLength: 0 });
+  await page.getByTestId('append-media').click();
+  await page.getByTestId('timeline-clip').first().click();
+  await page.getByLabel('Timeline playhead frame').fill('30');
+  await page.getByTestId('split-clip').click();
+  assert.equal(await page.getByTestId('timeline-clip').count(), 2);
+  await page.getByRole('button', { name: 'Undo', exact: true }).click();
+  assert.equal(await page.getByTestId('timeline-clip').count(), 1);
+  await page.getByRole('button', { name: 'Redo', exact: true }).click();
+  assert.equal(await page.getByTestId('timeline-clip').count(), 2);
+  await page.getByTestId('media-asset').filter({ hasText: 'Background tone' }).click();
+  await page.getByTestId('append-media').click();
+  assert.equal(await page.getByTestId('timeline-clip').count(), 3);
+  await app.evaluate(({ dialog }, filePath) => { dialog.showSaveDialog = async () => ({ canceled: false, filePath }); }, projectPath);
+  await page.getByRole('button', { name: 'Save', exact: true }).click();
+  await page.waitForFunction(() => document.querySelector('.project-title')?.textContent.includes('Saved'));
+  const saved = JSON.parse(await readFile(projectPath, 'utf8'));
+  assert.equal(saved.format, 'palmier-windows');
+  assert.equal(saved.timeline.tracks[0].clips.length, 2);
+  assert.equal(saved.timeline.tracks[0].clips[1].trimStartFrame, 30);
+  assert.equal(saved.timeline.tracks[1].clips.length, 1);
+  assert.equal(saved.media.some((media) => media.previewUrl), false);
+  await page.getByTestId('render-preview').click();
+  await page.waitForFunction(() => { const video = document.querySelector('video'); return !document.querySelector('.render-notification') && video?.videoWidth === 1280 && video.readyState >= 2; }, null, { timeout: 60000 });
+  await page.locator('video').evaluate(async (video) => { video.muted = true; await video.play(); });
+  await page.waitForFunction(() => document.querySelector('video')?.currentTime > 0.25);
+  await page.locator('video').evaluate((video) => video.pause());
+  assert.equal(await page.getByRole('alert').count(), 0);
+  const previewProperties = await page.locator('video').evaluate((video) => ({ duration: video.duration, width: video.videoWidth, height: video.videoHeight }));
+  assert.equal(previewProperties.width, 1280);
+  assert.equal(previewProperties.height, 720);
+  assert.ok(Math.abs(previewProperties.duration - 2) < 0.15);
+  await capture('editor.png');
+  await app.evaluate(({ dialog }, filePath) => { dialog.showSaveDialog = async () => ({ canceled: false, filePath }); }, exportPath);
+  await page.getByTestId('export-video').click();
+  await page.getByRole('button', { name: 'Show export', exact: true }).waitFor({ timeout: 60000 });
+  const exported = await probeMedia(exportPath, tools);
+  assert.equal(exported.width, 1280);
+  assert.equal(exported.height, 720);
+  assert.equal(exported.hasAudio, true);
+  assert.ok(Math.abs(exported.duration - 2) < 0.15);
+  await app.evaluate(({ dialog }, filePath) => { dialog.showOpenDialog = async () => ({ canceled: false, filePaths: [filePath] }); }, projectPath);
+  await page.getByRole('button', { name: 'New', exact: true }).click();
+  assert.equal(await page.getByTestId('timeline-clip').count(), 0);
+  await page.getByRole('button', { name: 'Open', exact: true }).click();
+  await page.getByTestId('timeline-clip').nth(2).waitFor();
+  assert.equal(await page.getByLabel('Project name', { exact: true }).inputValue(), 'Windows smoke sequence');
+  assert.equal(await page.getByTestId('timeline-clip').count(), 3);
+  const malicious = structuredClone(saved);
+  malicious.media[0].path = audioPath;
+  malicious.media[0].type = 'audio';
+  malicious.media[0].width = 0;
+  malicious.media[0].height = 0;
+  malicious.media[1].path = path.join(work, 'Missing audio.wav');
+  malicious.timeline.tracks[0].clips = [];
+  const failedPath = path.join(work, 'Fail safely.palmierpc');
+  await writeFile(failedPath, JSON.stringify(malicious));
+  await app.evaluate(({ dialog }, filePath) => { dialog.showOpenDialog = async () => ({ canceled: false, filePaths: [filePath] }); }, failedPath);
+  await assert.rejects(page.evaluate(() => window.palmier.openProject()), /Source is missing/);
+  await page.evaluate((project) => window.palmier.saveProject(project), saved);
+  assert.equal(await page.getByTestId('timeline-clip').count(), 3);
+  assert.deepEqual(errors, []);
+  const cancelPath = path.join(work, 'Cancelled on close.mp4');
+  const longProject = structuredClone(saved);
+  longProject.timeline.width = 1920;
+  longProject.timeline.height = 1080;
+  const base = longProject.timeline.tracks[0].clips[0];
+  longProject.timeline.tracks[0].clips = Array.from({ length: 32 }, (_, index) => ({ ...base, id: `close-clip-${index}`, startFrame: index * 30, trimStartFrame: 0, durationFrames: 30 }));
+  longProject.timeline.tracks[1].clips = [];
+  await app.evaluate(({ dialog }, filePath) => { dialog.showSaveDialog = async () => ({ canceled: false, filePath }); }, cancelPath);
+  await page.evaluate((project) => {
+    window.cancelRenderStarted = false;
+    window.palmier.onRenderProgress(() => { window.cancelRenderStarted = true; });
+    window.palmier.render(project, 'export').catch(() => {});
+  }, longProject);
+  await page.waitForFunction(() => window.cancelRenderStarted);
+  const closed = app.waitForEvent('close');
+  await app.evaluate(({ BrowserWindow }) => { BrowserWindow.getAllWindows()[0].close(); });
+  await closed;
+  const leftovers = await readdir(work);
+  assert.equal(leftovers.some((entry) => entry.startsWith('.palmier-render-') || entry === 'Cancelled on close.mp4'), false);
+  const result = { ok: true, packaged: Boolean(process.env.PALMIER_SMOKE_EXECUTABLE), platform: process.platform, tools: status.tools.version, project: projectPath, export: exportPath, screenshot: path.join(work, 'editor.png'), preview: previewProperties, checks: ['sandbox', 'import', 'thumbnail', 'source metadata', 'media GET/HEAD/Range', 'append', 'split', 'undo', 'redo', 'mixed audio', 'save', 'preview playback', 'export', 'reopen', 'failed-open registry preservation', 'close cancels render and cleans staging'] };
+  await writeFile(path.join(work, 'result.json'), JSON.stringify(result, null, 2));
+  console.log(JSON.stringify(result, null, 2));
+} catch (error) {
+  if (page && !page.isClosed()) {
+    console.error((await page.locator('body').innerText()).slice(0, 14000));
+    await capture('failure.png').catch(() => {});
+  }
+  console.error('Artifacts:', work);
+  throw error;
+} finally {
+  await app.evaluate(({ dialog }) => { dialog.showMessageBoxSync = () => 1; }).catch(() => {});
+  await app.close().catch(() => {});
+}
